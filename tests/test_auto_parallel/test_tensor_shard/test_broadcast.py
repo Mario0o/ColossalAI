@@ -1,7 +1,10 @@
 import torch
 
-from colossalai.auto_parallel.tensor_shard.utils import (get_broadcast_shape, is_broadcastable,
-                                                         recover_sharding_spec_for_broadcast_shape)
+from colossalai.auto_parallel.tensor_shard.utils import (
+    get_broadcast_shape,
+    is_broadcastable,
+    recover_sharding_spec_for_broadcast_shape,
+)
 from colossalai.device.device_mesh import DeviceMesh
 from colossalai.tensor.sharding_spec import ShardingSpec
 
@@ -45,17 +48,15 @@ def test_recover_sharding_spec_for_broadcast_shape():
     device_mesh = DeviceMesh(physical_mesh_id, mesh_shape)
 
     broadcast_shape = get_broadcast_shape(x1.shape, x2.shape)
-    logical_sharding_spec_for_x1 = ShardingSpec(device_mesh=device_mesh,
-                                                dim_partition_dict={
-                                                    0: [0],
-                                                    1: [1]
-                                                },
-                                                entire_shape=broadcast_shape)
-    physical_sharding_spec_for_x1 = recover_sharding_spec_for_broadcast_shape(logical_sharding_spec_for_x1,
-                                                                              broadcast_shape, x1.shape)
+    logical_sharding_spec_for_x1 = ShardingSpec(
+        device_mesh=device_mesh, dim_partition_dict={0: [0], 1: [1]}, entire_shape=broadcast_shape
+    )
+    physical_sharding_spec_for_x1, removed_dims = recover_sharding_spec_for_broadcast_shape(
+        logical_sharding_spec_for_x1, broadcast_shape, x1.shape
+    )
     print(physical_sharding_spec_for_x1)
 
     assert physical_sharding_spec_for_x1.entire_shape == x1.shape
     # dim 1 for the physical tensor is of broadcast type MULTIPLE, so should ignore
     assert physical_sharding_spec_for_x1.dim_partition_dict == {0: [0]}
-    assert physical_sharding_spec_for_x1.sharding_sequence == ['S0', 'R', 'R']
+    assert physical_sharding_spec_for_x1.sharding_sequence == ["S0", "R", "R"]

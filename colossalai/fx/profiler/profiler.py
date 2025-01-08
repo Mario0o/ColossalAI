@@ -9,13 +9,13 @@ from torch.nn.parameter import Parameter
 from torch.utils._pytree import tree_map
 
 from .._compatibility import compatibility
-from .constants import ALIAS_ATEN
+from .constants import ALIAS_ATEN, OUTPUT_SAVED_MOD, OUTPUT_SAVED_OPS
 from .dataflow import GraphInfo, Phase, autograd_graph_analysis, is_phase
-from .memory import activation_size, parameter_size
+from .memory_utils import activation_size, parameter_size
 from .opcount import flop_mapping
 from .tensor import MetaTensor
 
-__all__ = ['profile_function', 'profile_module', 'profile_method']
+__all__ = ["profile_function", "profile_module", "profile_method"]
 
 # super-dainiu: this cache should be global, otherwise it cannot
 # track duplicated tensors between nodes
@@ -174,7 +174,6 @@ def _profile_meta(target: Callable, *args, **kwargs) -> Tuple[Tuple[Any, ...], G
     # backward is executed.
     # Hopefully, this attempt will provide a better estimation of memory.
     class FlopTensor(MetaTensor):
-
         _node: Node = None
 
         def __repr__(self):
@@ -186,24 +185,24 @@ def _profile_meta(target: Callable, *args, **kwargs) -> Tuple[Tuple[Any, ...], G
         def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
             args_node = tree_map(lambda x: x._node if isinstance(x, FlopTensor) else None, args)
             kwargs_node = tree_map(lambda x: x._node if isinstance(x, FlopTensor) else None, kwargs)
-            node = subgraph.create_node('call_function', func, args_node, kwargs_node)
+            node = subgraph.create_node("call_function", func, args_node, kwargs_node)
 
             out = super().__torch_dispatch__(func, types, args, kwargs)
 
             flop_count[phase] += flop_mapping[func](args, normalize_tuple(out))
-            node.meta['phase'] = phase
+            node.meta["phase"] = phase
 
             # super-dainiu: in `nn.MultiheadAttention` this weird thing occurs,
             # i.e. `Phase.PLACEHOLDER` tensors are aliased and saved during
             # `Phase.FORWARD`
             if phase == Phase.FORWARD:
                 if all(map(partial(is_phase, phase=Phase.PLACEHOLDER), node.all_input_nodes)) and func in ALIAS_ATEN:
-                    node.meta['phase'] = Phase.PLACEHOLDER
+                    node.meta["phase"] = Phase.PLACEHOLDER
 
             # TODO(yby): specify `saved_tensors` for backward memory estimation
-            node.meta['saved_tensor'] = []
+            node.meta["saved_tensor"] = []
             if phase == Phase.BACKWARD:
-                node.meta['saved_tensor'] = normalize_tuple(out)
+                node.meta["saved_tensor"] = normalize_tuple(out)
 
             def wrap(x):
                 if isinstance(x, MetaTensor):
@@ -219,11 +218,14 @@ def _profile_meta(target: Callable, *args, **kwargs) -> Tuple[Tuple[Any, ...], G
             x = FlopTensor(x)
             if is_autogradable(x):
                 x.requires_grad_(True)
-            x._node = subgraph.create_node('placeholder',
-                                           'placeholder', (subgraph._root,),
-                                           name=subgraph._graph_namespace.create_name('input', x._tensor))
-            x._node.meta['phase'] = Phase.PLACEHOLDER
-            x._node.meta['saved_tensor'] = []
+            x._node = subgraph.create_node(
+                "placeholder",
+                "placeholder",
+                (subgraph._root,),
+                name=subgraph._graph_namespace.create_name("input", x._tensor),
+            )
+            x._node.meta["phase"] = Phase.PLACEHOLDER
+            x._node.meta["saved_tensor"] = []
         return x
 
     # Basically, we need to detach the args and kwargs from the outer graph.
@@ -232,12 +234,12 @@ def _profile_meta(target: Callable, *args, **kwargs) -> Tuple[Tuple[Any, ...], G
 
     def pack(x):
         global cache, do_not_cache
-        if isinstance(x, FlopTensor) and not x._tensor.uuid in cache:
+        if isinstance(x, FlopTensor) and not x._tensor.data_ptr() in cache:
             tensor = x._tensor.detach()
-            tensor.uuid = x._tensor.uuid
-            x._node.meta['saved_tensor'] += [tensor]
+            tensor.data_ptr = x._tensor.data_ptr
+            x._node.meta["saved_tensor"] += [tensor]
             if not do_not_cache:
-                cache.add(x._tensor.uuid)
+                cache.add(x._tensor.data_ptr())
         return x
 
     def unpack(x):
@@ -270,9 +272,10 @@ def _profile_meta(target: Callable, *args, **kwargs) -> Tuple[Tuple[Any, ...], G
     def extract_tensor(x: Any):
         if isinstance(x, MetaTensor):
             tensor = x._tensor.detach()
-            tensor.uuid = x._tensor.uuid
+            tensor.data_ptr = x._tensor.data_ptr
             return tensor
-        return x
+        if not isinstance(x, torch.finfo):
+            return x
 
     graph_info.fwd_out = list(map(extract_tensor, normalize_tuple(out)))
 
@@ -283,15 +286,15 @@ def _profile_meta(target: Callable, *args, **kwargs) -> Tuple[Tuple[Any, ...], G
 
 
 @compatibility(is_backward_compatible=True)
-def profile_function(target: 'Target', device: str = 'meta') -> Callable:
+def profile_function(target: "Target", device: str = "meta") -> Callable:
     """
-    Wrap a `call_function` node or `torch.nn.functional` in order to 
+    Wrap a `call_function` node or `torch.nn.functional` in order to
     record the memory cost and FLOPs of the execution.
-    
+
     Warnings:
         You may only use tensors with `device=meta` for this wrapped function.
         Only original `torch.nn.functional` are available.
-    
+
     Examples:
         >>> input = torch.rand(100, 100, 100, 100, device='meta')
         >>> func = torch.nn.functional.relu
@@ -299,7 +302,6 @@ def profile_function(target: 'Target', device: str = 'meta') -> Callable:
     """
 
     def f(*args: Tuple[Argument, ...], **kwargs: Dict[str, Any]) -> Any:
-
         # find the grad for parameter in args and kwargs
         param_size = 0
 
@@ -314,23 +316,21 @@ def profile_function(target: 'Target', device: str = 'meta') -> Callable:
         # If there is an argument that this `call_function` is inplace, we should
         # still run the profiling but discard some results regarding `target`
         global do_not_cache
-        inplace = kwargs.get('inplace', False)
-        if inplace or target in [torch.nn.functional.relu]:
+
+        inplace = kwargs.get("inplace", False)
+        if target in OUTPUT_SAVED_OPS:
             do_not_cache = True
-            kwargs['inplace'] = False
-        if device == 'meta':
+        if inplace:
+            do_not_cache = True
+            kwargs["inplace"] = False
+        if device == "meta":
             out, meta = _profile_meta(func, *args, **kwargs)
-            # currently we set the fwd_mem_tmp of ReLU to zero
-            if target in [torch.nn.functional.relu]:
-                meta.fwd_in = []
-                meta.fwd_tmp = []
-                meta.bwd_mem_out = 0
-                meta.fwd_mem_tmp = 0
         else:
             out, meta = _profile_concrete(func, *args, **kwargs)
-
         if inplace:
-            kwargs['inplace'] = True
+            kwargs["inplace"] = True
+            meta.bwd_mem_tmp = 0
+            meta.bwd_mem_out = 0
         do_not_cache = False
 
         meta.bwd_mem_out -= param_size
@@ -342,16 +342,16 @@ def profile_function(target: 'Target', device: str = 'meta') -> Callable:
 
 
 @compatibility(is_backward_compatible=True)
-def profile_method(target: 'Target', device: str = 'meta') -> Callable:
+def profile_method(target: "Target", device: str = "meta") -> Callable:
     """
     Wrap a `call_method` node
-    record the memory cost and FLOPs of the execution. 
+    record the memory cost and FLOPs of the execution.
     """
 
     def f(*args: Tuple[Argument, ...], **kwargs: Dict[str, Any]) -> Any:
         # execute the method and return the result
-        assert isinstance(target, str), f'{target} instance is not str.'
-        if device == 'meta':
+        assert isinstance(target, str), f"{target} instance is not str."
+        if device == "meta":
             out, meta = _profile_meta(target, *args, **kwargs)
         else:
             out, meta = _profile_concrete(target, *args, **kwargs)
@@ -361,15 +361,15 @@ def profile_method(target: 'Target', device: str = 'meta') -> Callable:
 
 
 @compatibility(is_backward_compatible=True)
-def profile_module(module: torch.nn.Module, device: str = 'meta') -> Callable:
+def profile_module(module: torch.nn.Module, device: str = "meta") -> Callable:
     """
-    Wrap a `call_module` node or `torch.nn` in order to 
+    Wrap a `call_module` node or `torch.nn` in order to
     record the memory cost and FLOPs of the execution.
-    
+
     Warnings:
         You may only use tensors with `device=meta` for this wrapped function.
         Only original `torch.nn` are available.
-    
+
     Example:
         >>> input = torch.rand(4, 3, 224, 224, device='meta')
         >>> mod = torch.nn.Conv2d(3, 128, 3)
@@ -377,7 +377,6 @@ def profile_module(module: torch.nn.Module, device: str = 'meta') -> Callable:
     """
 
     def f(*args: Tuple[Argument, ...], **kwargs: Dict[str, Any]) -> Any:
-
         # calculate parameter size
         param_size = parameter_size(module)
 
@@ -385,22 +384,20 @@ def profile_module(module: torch.nn.Module, device: str = 'meta') -> Callable:
         # still run the profiling but discard some results regarding `module`.
         global do_not_cache
 
-        inplace = getattr(module, 'inplace', False)
-        if inplace or type(module) in [torch.nn.ReLU]:
+        inplace = getattr(module, "inplace", False)
+        if type(module) in OUTPUT_SAVED_MOD:
+            do_not_cache = True
+        if inplace:
             do_not_cache = True
             module.inplace = False
-        if device == 'meta':
+        if device == "meta":
             out, meta = _profile_meta(func, *args, **kwargs)
-            # currently we set the fwd_tmp of ReLU to []
-            if type(module) in [torch.nn.ReLU]:
-                meta.fwd_in = []
-                meta.fwd_tmp = []
-                meta.bwd_mem_out = 0
         else:
             out, meta = _profile_concrete(func, *args, **kwargs)
         if inplace:
-
             module.inplace = True
+            meta.bwd_mem_tmp = 0
+            meta.bwd_mem_out = 0
         do_not_cache = False
 
         # grad for param will not be counted
